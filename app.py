@@ -1,70 +1,61 @@
-import requests
-import pandas as pd
+# pip install streamlit requests pandas numpy
+import requests, pandas as pd, numpy as np, datetime as dt
 import streamlit as st
-import plotly.express as px
 
-"""
-Bu uygulama Binance API'sinden Long/Short oranlarını çekerek
-grafik halinde gösterir.
-"""
+BINANCE = "fapi.binance.com/futures/data"
 
-# API'den veri çekme fonksiyonu
-def fetch_ratio(ep, symbol, tf):
-    url = f"{ep}?symbol={symbol}&period={tf}&limit=1000"
+SYMS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","ADAUSDT"]
 
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()  # HTTP hatası varsa burada durur
-        data = r.json()
+st.set_page_config(page_title="Long/Short Radar", layout="wide")
+st.title("Long/Short Radar (Binance Futures)")
 
-        if not data:
-            st.warning("API veri döndürmedi.")
-            return pd.DataFrame()
+sym = st.selectbox("Sembol", SYMS, index=0)
+tf_choice = st.radio("Zaman Penceresi", ["12h","24h","1w","1mo"], horizontal=True)
 
-        df = pd.DataFrame(data)
+def since_ms(window):
+    now = int(dt.datetime.utcnow().timestamp()*1000)
+    hours = {"12h":12,"24h":24,"1w":7*24,"1mo":30*24}[window]
+    return now - hours*60*60*1000
 
-        # Tarih formatlama
-        if 'timestamp' in df.columns:
-            df["time"] = pd.to_datetime(df["timestamp"], unit="ms")
+def fetch_ratio(endpoint, symbol, window):
+    params = {"symbol": symbol, "period": "5m", "limit": 1000}
+    url = f"{BINANCE}/{endpoint}"
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    df = pd.DataFrame(r.json())
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df = df[df["timestamp"].astype("int64")//10**6 >= since_ms(window)]
+    # longShortRatio = long/short; long% = ratio/(1+ratio)
+    df["ratio"] = df["longShortRatio"].astype(float)
+    df["long_pct"] = df["ratio"]/(1+df["ratio"])
+    df["short_pct"] = 1 - df["long_pct"]
+    return df
 
-        # Long/Short yüzdesi hesaplama
-        if 'longAccount' in df.columns and 'shortAccount' in df.columns:
-            df["long_pct"] = df["longAccount"].astype(float) * 100
-            df["short_pct"] = df["shortAccount"].astype(float) * 100
+tabs = st.tabs(["Tüm Hesaplar","Top Trader (Hesap)","Top Trader (Pozisyon)"])
+endpoints = ["globalLongShortAccountRatio","topLongShortAccountRatio","topLongShortPositionRatio"]
 
-        return df
+summaries = []
+for i,ep in enumerate(endpoints):
+    with tabs[i]:
+        df = fetch_ratio(ep, sym, tf_choice)
+        if df.empty:
+            st.warning("Veri yok.")
+            continue
+        # Ağırlıklı ortalama (işlem adedi yerine zaman ağırlığı → medyan + EMA karışımı)
+        long_med = df["long_pct"].median()
+        long_ema = df["long_pct"].ewm(span=round(len(df)/3)).mean().iloc[-1]
+        long_pct = float((long_med+long_ema)/2)
+        short_pct = 1-long_pct
+        dom = "LONG baskın" if long_pct>0.53 else "SHORT baskın" if long_pct<0.47 else "Nötr"
+        st.metric("Dominance", dom, delta=f"Long %{long_pct*100:.1f} / Short %{short_pct*100:.1f}")
+        st.line_chart(df.set_index("timestamp")[["long_pct","short_pct"]])
+        summaries.append((ep, long_pct, short_pct, dom))
 
-    except requests.exceptions.HTTPError as e:
-        st.error(f"HTTP hatası: {e}")
-        return pd.DataFrame()
-    except requests.exceptions.RequestException as e:
-        st.error(f"İstek hatası: {e}")
-        return pd.DataFrame()
-    except Exception as e:
-        st.error(f"Bilinmeyen hata: {e}")
-        return pd.DataFrame()
+st.subheader("Özet")
+for name,lp,sp,dom in summaries:
+    label = {"globalLongShortAccountRatio":"Tüm Hesaplar",
+             "topLongShortAccountRatio":"Top Trader (Hesap)",
+             "topLongShortPositionRatio":"Top Trader (Pozisyon)"}[name]
+    st.write(f"*{label}* – {dom} (Long %{lp*100:.1f} / Short %{sp*100:.1f})")
 
-# Streamlit başlığı
-st.title("📊 Binance Long / Short Oran Takip")
-
-# Kullanıcı seçenekleri
-symbol = st.selectbox("Sembol Seçin", ["BTCUSDT", "ETHUSDT", "BNBUSDT"])
-tf_choice = st.selectbox("Zaman Aralığı", ["5m", "15m", "30m", "1h", "4h", "1d"])
-
-# Binance API endpoint
-ep = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
-
-# Veri çekme
-df = fetch_ratio(ep, symbol, tf_choice)
-
-if not df.empty:
-    st.success(f"Veriler başarıyla alındı: {symbol} - {tf_choice}")
-
-    # Grafik çizimi
-    fig = px.line(df, x="time", y=["long_pct", "short_pct"],
-                  labels={"value": "Yüzde (%)", "time": "Zaman"},
-                  title=f"{symbol} Long / Short Oranları ({tf_choice})")
-    st.plotly_chart(fig, use_container_width=True)
-
-else:
-    st.warning("Gösterilecek veri yok.")
+st.caption("Not: 53% üstü LONG, 47% altı SHORT baskın
