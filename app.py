@@ -22,22 +22,16 @@ def since_ms(window):
 def fetch_ratio(endpoint, symbol, window):
     params = {"symbol": symbol, "period": "5m", "limit": 1000}
     url = f"{BINANCE}/{endpoint}"
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-    except requests.exceptions.RequestException as e:
-        st.error(f"API hatası: {e}")
-        return pd.DataFrame()
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
 
+    data = r.json()
     if not isinstance(data, list) or len(data) == 0:
-        st.warning("Veri bulunamadı.")
         return pd.DataFrame()
 
     df = pd.DataFrame(data)
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     df = df[df["timestamp"].astype("int64") // 10**6 >= since_ms(window)]
-
     df["ratio"] = df["longShortRatio"].astype(float)
     df["long_pct"] = df["ratio"] / (1 + df["ratio"])
     df["short_pct"] = 1 - df["long_pct"]
@@ -51,9 +45,27 @@ for i, ep in enumerate(endpoints):
     with tabs[i]:
         df = fetch_ratio(ep, sym, tf_choice)
         if df.empty:
+            st.warning("Veri yok.")
             continue
+
         long_med = df["long_pct"].median()
         long_ema = df["long_pct"].ewm(span=round(len(df) / 3)).mean().iloc[-1]
         long_pct = float((long_med + long_ema) / 2)
         short_pct = 1 - long_pct
-        dom = "LONG baskın" if long_pct_
+
+        dom = "LONG baskın" if long_pct > 0.53 else "SHORT baskın" if long_pct < 0.47 else "Nötr"
+
+        st.metric("Dominance", dom, delta=f"Long %{long_pct*100:.1f} / Short %{short_pct*100:.1f}")
+        st.line_chart(df.set_index("timestamp")[["long_pct", "short_pct"]])
+        summaries.append((ep, long_pct, short_pct, dom))
+
+st.subheader("Özet")
+for name, lp, sp, dom in summaries:
+    label = {
+        "globalLongShortAccountRatio": "Tüm Hesaplar",
+        "topLongShortAccountRatio": "Top Trader (Hesap)",
+        "topLongShortPositionRatio": "Top Trader (Pozisyon)"
+    }[name]
+    st.write(f"*{label}* – {dom} (Long %{lp*100:.1f} / Short %{sp*100:.1f})")
+
+st.caption("Not: 53% üstü LONG, 47% altı SHORT baskın")
